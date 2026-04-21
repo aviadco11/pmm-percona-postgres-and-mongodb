@@ -1,4 +1,4 @@
-# PMM + PostgreSQL + MongoDB Docker Compose
+# Monitor PostgreSQL And MongoDB with PMM Percona
 
 This repository contains a Docker Compose setup for:
 
