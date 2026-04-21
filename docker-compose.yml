@@ -1,1 +1,191 @@
-"" 
+# endpoint : http://localhost:80
+# Credentials
+# PMM UI: admin / admin
+# PostgreSQL for monitoring: postgresdb / postgresdb123
+# MongoDB: mongoadmin / mongoadmin123
+# mongo-express: http://localhost:8081, admin / admin123
+# pgadmin connector : http://localhost:5050, connect with admin@admin.com:admin
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - PMM_CLIENT_USER=${PMM_CLIENT_USER}
+      - PMM_CLIENT_PASSWORD=${PMM_CLIENT_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-postgres.sh:/docker-entrypoint-initdb.d/init-postgres.sh
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c track_activity_query_size=2048
+      -c logging_collector=on
+      -c log_min_duration_statement=10
+      -c log_line_prefix='%m [%p] %q%u@%d '
+      -c log_statement=none
+    networks:
+      - postgresdb_network
+
+  pmm-server:
+    image: percona/pmm-server:2.43.2   # pinned – 2.44.1 has broken Python encodings
+    platform: linux/amd64
+    container_name: postgresdb_pmm_server
+    restart: always
+    environment:
+      - PMM_DATA_RETENTION=48h
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - pmm_data:/srv
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS http://localhost/v1/readyz >/dev/null || exit 1']
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 180s
+    networks:
+      - postgresdb_network
+
+  pmm-client:
+    image: percona/pmm-client:2
+    container_name: postgresdb_pmm_client
+    restart: on-failure
+    depends_on:
+      pmm-server:
+        condition: service_healthy
+      postgres:
+        condition: service_started
+      mongodb:
+        condition: service_started
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - PMM_CLIENT_USER=${PMM_CLIENT_USER}
+      - PMM_CLIENT_PASSWORD=${PMM_CLIENT_PASSWORD}
+      - MONGO_ROOT_USER=${MONGO_ROOT_USER}
+      - MONGO_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        # 1. Clear old configs to prevent registration conflicts
+        rm -f /usr/local/percona/pmm2/config/pmm-agent.yml
+
+        # 2. Wait for PMM server API to actually respond
+        echo "Waiting for PMM server API..."
+        for i in $$(seq 1 40); do
+          curl -kfsS https://pmm-server:443/v1/readyz >/dev/null 2>&1 && break
+          echo "  API not ready (attempt $$i), retrying in 5s..."
+          sleep 5
+        done
+
+        # 3. Register the agent with PMM server
+        echo "Registering pmm-agent with PMM server..."
+        for i in $$(seq 1 10); do
+          pmm-agent setup --server-insecure-tls --server-address=pmm-server:443 --server-username=admin --server-password=admin --config-file=/usr/local/percona/pmm2/config/pmm-agent.yml && break
+          echo "  Setup attempt $$i failed, retrying in 5s..."
+          sleep 5
+        done
+
+        # 4. Start the agent daemon in the background
+        pmm-agent --config-file=/usr/local/percona/pmm2/config/pmm-agent.yml &
+
+        # 5. Wait for the agent to initialize before adding the DB
+        echo "Waiting for pmm-agent to start..."
+        for i in $$(seq 1 20); do
+          pmm-admin status >/dev/null 2>&1 && break
+          sleep 3
+        done
+
+        # 6. Add the PostgreSQL service for monitoring (skip if already added)
+        pmm-admin add postgresql \
+          --username="$$PMM_CLIENT_USER" \
+          --password="$$PMM_CLIENT_PASSWORD" \
+          --host=postgres \
+          --port=5432 \
+          --database="$$POSTGRES_DB" \
+          --service-name=postgres \
+          --query-source=pgstatements || true
+
+        # 7. Add the MongoDB service for monitoring (skip if already added)
+        pmm-admin add mongodb \
+          --username="pmm" \
+          --password="pmm" \
+          --authentication-database=admin \
+          --host=mongodb \
+          --port=27017 \
+          --service-name=mongodb \
+          --query-source=profiler || true
+
+        echo "PMM client setup complete."
+        # Keep the container running
+        wait
+    networks:
+      - postgresdb_network
+
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    restart: always
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USER}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD}
+    command: mongod --profile=1 --slowms=10 --auth
+    volumes:
+      - mongo_data:/data/db
+      - ./init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    networks:
+      - postgresdb_network
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: postgresdb_pgadmin
+    restart: always
+    depends_on:
+      - postgres
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=${PGADMIN_DEFAULT_EMAIL}
+      - PGADMIN_DEFAULT_PASSWORD=${PGADMIN_DEFAULT_PASSWORD}
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - postgresdb_network
+
+  mongo-express:
+    image: mongo-express:latest
+    container_name: mongo_express
+    restart: always
+    depends_on:
+      - mongodb
+    environment:
+      - ME_CONFIG_MONGODB_ADMINUSERNAME=${MONGO_ROOT_USER}
+      - ME_CONFIG_MONGODB_ADMINPASSWORD=${MONGO_ROOT_PASSWORD}
+      - ME_CONFIG_MONGODB_SERVER=mongodb
+      - ME_CONFIG_MONGODB_PORT=27017
+      - ME_CONFIG_BASICAUTH_USERNAME=${MONGO_EXPRESS_USER}
+      - ME_CONFIG_BASICAUTH_PASSWORD=${MONGO_EXPRESS_PASSWORD}
+    ports:
+      - "8081:8081"
+    networks:
+      - postgresdb_network
+
+networks:
+  postgresdb_network:
+    name: postgresdb_network  # Fixed name to prevent folder-prefixing
+    driver: bridge
+
+volumes:
+  postgres_data:
+  pmm_data:
+  pgadmin_data:
+  mongo_data:
+
